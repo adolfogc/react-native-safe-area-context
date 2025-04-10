@@ -1,81 +1,103 @@
 package com.th3rdwave.safeareacontext
 
 import android.content.Context
+import android.graphics.Rect
 import android.util.Log
 import android.view.View
 import android.view.ViewTreeObserver
 import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.ReactContext
+import com.facebook.react.fabric.FabricUIManager
 import com.facebook.react.uimanager.StateWrapper
-import com.facebook.react.uimanager.UIManagerModule
+import com.facebook.react.uimanager.UIManagerHelper
+import com.facebook.react.uimanager.common.UIManagerType
 import com.facebook.react.views.view.ReactViewGroup
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
-private const val MAX_WAIT_TIME_NANO = 500000000L // 500ms
+private const val TAG = "SafeAreaView"
+private const val MAX_WAIT_TIME_NANO = 500_000_000L // 500ms
 
-class SafeAreaView(context: Context?) :
-    ReactViewGroup(context), ViewTreeObserver.OnPreDrawListener {
-  private var mMode = SafeAreaViewMode.PADDING
-  private var mInsets: EdgeInsets? = null
-  private var mEdges: SafeAreaViewEdges? = null
-  private var mProviderView: View? = null
-  private var mStateWrapper: StateWrapper? = null
+class SafeAreaView(context: Context?) : ReactViewGroup(context), ViewTreeObserver.OnPreDrawListener {
 
-  fun getStateWrapper(): StateWrapper? {
-    return mStateWrapper
-  }
+  private var mode = SafeAreaViewMode.PADDING
+  private var insets: EdgeInsets? = null
+  private var edges: SafeAreaViewEdges? = null
+  private var providerView: View? = null
+  private var stateWrapper: StateWrapper? = null
+
+  fun getStateWrapper(): StateWrapper? = stateWrapper
 
   fun setStateWrapper(stateWrapper: StateWrapper?) {
-    mStateWrapper = stateWrapper
+    this.stateWrapper = stateWrapper
   }
 
+  /**
+   * Updates the view's safe area insets.
+   */
   private fun updateInsets() {
-    val insets = mInsets
-    if (insets != null) {
-      val edges =
-          mEdges
-              ?: SafeAreaViewEdges(
-                  SafeAreaViewEdgeModes.ADDITIVE,
-                  SafeAreaViewEdgeModes.ADDITIVE,
-                  SafeAreaViewEdgeModes.ADDITIVE,
-                  SafeAreaViewEdgeModes.ADDITIVE)
-      val stateWrapper = getStateWrapper()
-      if (stateWrapper != null) {
+    insets?.let { currentInsets ->
+      // Provide default edge modes if not set.
+      val currentEdges = edges ?: SafeAreaViewEdges(
+        SafeAreaViewEdgeModes.ADDITIVE,
+        SafeAreaViewEdgeModes.ADDITIVE,
+        SafeAreaViewEdgeModes.ADDITIVE,
+        SafeAreaViewEdgeModes.ADDITIVE
+      )
+
+      // Update state using StateWrapper if available.
+      stateWrapper?.let { wrapper ->
         val map = Arguments.createMap()
-        map.putMap("insets", edgeInsetsToJsMap(insets))
-        stateWrapper.updateState(map)
-      } else {
-        val localData = SafeAreaViewLocalData(insets = insets, mode = mMode, edges = edges)
-        val reactContext = getReactContext(this)
-        val uiManager = reactContext.getNativeModule(UIManagerModule::class.java)
-        if (uiManager != null) {
-          uiManager.setViewLocalData(id, localData)
-          // Sadly there doesn't seem to be a way to properly dirty a yoga node from java, so if we
-          // are in
-          // the middle of a layout, we need to recompute it. There is also no way to know whether
-          // we
-          // are in the middle of a layout so always do it.
-          reactContext.runOnNativeModulesQueueThread {
-            uiManager.uiImplementation.dispatchViewUpdates(-1)
+        map.putMap("insets", edgeInsetsToJsMap(currentInsets))
+        wrapper.updateState(map)
+        return
+      } ?: run {
+        // Otherwise use the Fabric-compatible update.
+        val reactContext = context as? ReactContext
+        if (reactContext == null) {
+          Log.e(TAG, "Context is not an instance of ReactContext")
+          return
+        }
+
+        try {
+          val surfaceId = UIManagerHelper.getSurfaceId(reactContext)
+          val fabricUIManager =
+            UIManagerHelper.getUIManager(reactContext, UIManagerType.FABRIC) as? FabricUIManager
+          if (fabricUIManager != null) {
+            val event = InsetsChangeEvent(
+              surfaceId,
+              id,
+              currentInsets,
+              Rect(0f, 0f, width.toFloat(), height.toFloat())
+            )
+            UIManagerHelper.getEventDispatcherForReactTag(reactContext, id)?.dispatchEvent(event)
+            // Request layout to ensure UI updates.
+            requestLayout()
+            // Wait for the native modules queue thread to process this update.
+            waitForReactLayout(reactContext)
+          } else {
+            Log.e(TAG, "Failed to retrieve FabricUIManager")
           }
-          waitForReactLayout()
+        } catch (e: Exception) {
+          Log.e(TAG, "Error updating safe area insets", e)
         }
       }
     }
   }
 
-  private fun waitForReactLayout() {
-    // Block the main thread until the native module thread is finished with
-    // its current tasks. To do this we use the done boolean as a lock and enqueue
-    // a task on the native modules thread. When the task runs we can unblock the
-    // main thread. This should be safe as long as the native modules thread
-    // does not block waiting on the main thread.
+  /**
+   * Blocks the main thread until the native module thread is done processing,
+   * or until MAX_WAIT_TIME_NANO has elapsed.
+   */
+  private fun waitForReactLayout(reactContext: ReactContext) {
     var done = false
     val lock = ReentrantLock()
     val condition = lock.newCondition()
     val startTime = System.nanoTime()
     var waitTime = 0L
-    getReactContext(this).runOnNativeModulesQueueThread {
+
+    // Enqueue a task on the native modules queue thread.
+    reactContext.runOnNativeModulesQueueThread {
       lock.withLock {
         if (!done) {
           done = true
@@ -83,44 +105,52 @@ class SafeAreaView(context: Context?) :
         }
       }
     }
+    // Wait for the condition to be signaled or until timeout.
     lock.withLock {
       while (!done && waitTime < MAX_WAIT_TIME_NANO) {
         try {
           condition.awaitNanos(MAX_WAIT_TIME_NANO)
         } catch (ex: InterruptedException) {
-          // In case of an interrupt just give up waiting.
+          // If interrupted, give up waiting.
           done = true
         }
-        waitTime += System.nanoTime() - startTime
+        waitTime = System.nanoTime() - startTime
       }
     }
-    // Timed out waiting.
     if (waitTime >= MAX_WAIT_TIME_NANO) {
-      Log.w("SafeAreaView", "Timed out waiting for layout.")
+      Log.w(TAG, "Timed out waiting for layout.")
     }
   }
 
   fun setMode(mode: SafeAreaViewMode) {
-    mMode = mode
+    this.mode = mode
     updateInsets()
   }
 
   fun setEdges(edges: SafeAreaViewEdges) {
-    mEdges = edges
+    this.edges = edges
     updateInsets()
   }
 
+  /**
+   * Checks for updates to the safe area insets. Returns true if an update was made.
+   */
   private fun maybeUpdateInsets(): Boolean {
-    val providerView = mProviderView ?: return false
-    val edgeInsets = getSafeAreaInsets(providerView) ?: return false
-    if (mInsets != edgeInsets) {
-      mInsets = edgeInsets
-      updateInsets()
-      return true
+    providerView?.let { view ->
+      getSafeAreaInsets(view)?.let { computedInsets ->
+        if (insets != computedInsets) {
+          insets = computedInsets
+          updateInsets()
+          return true
+        }
+      }
     }
     return false
   }
 
+  /**
+   * Searches up the view hierarchy for a SafeAreaProvider.
+   */
   private fun findProvider(): View {
     var current = parent
     while (current != null) {
@@ -134,15 +164,15 @@ class SafeAreaView(context: Context?) :
 
   override fun onAttachedToWindow() {
     super.onAttachedToWindow()
-    mProviderView = findProvider()
-    mProviderView?.viewTreeObserver?.addOnPreDrawListener(this)
+    providerView = findProvider()
+    providerView?.viewTreeObserver?.addOnPreDrawListener(this)
     maybeUpdateInsets()
   }
 
   override fun onDetachedFromWindow() {
     super.onDetachedFromWindow()
-    mProviderView?.viewTreeObserver?.removeOnPreDrawListener(this)
-    mProviderView = null
+    providerView?.viewTreeObserver?.removeOnPreDrawListener(this)
+    providerView = null
   }
 
   override fun onPreDraw(): Boolean {
@@ -150,6 +180,7 @@ class SafeAreaView(context: Context?) :
     if (didUpdate) {
       requestLayout()
     }
+    // Returning false cancels the current draw pass.
     return !didUpdate
   }
 }
