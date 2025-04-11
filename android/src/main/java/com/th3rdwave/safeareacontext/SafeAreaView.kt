@@ -12,17 +12,19 @@ import com.facebook.react.uimanager.StateWrapper
 import com.facebook.react.uimanager.UIManagerHelper
 import com.facebook.react.uimanager.common.UIManagerType
 import com.facebook.react.views.view.ReactViewGroup
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 private const val TAG = "SafeAreaView"
-private const val MAX_WAIT_TIME_NANO = 500_000_000L // 500ms
 
+/**
+ * SafeAreaView implementation for React Native Fabric.
+ * 
+ * This class detects safe area insets changes and communicates them to the Fabric system.
+ * It does not directly modify view properties, instead relying on Fabric to apply the
+ * appropriate layout changes based on insets, mode, and edge settings.
+ */
 class SafeAreaView(context: Context?) : ReactViewGroup(context), ViewTreeObserver.OnPreDrawListener {
 
-  private var mode = SafeAreaViewMode.PADDING
   private var insets: EdgeInsets? = null
-  private var edges: SafeAreaViewEdges? = null
   private var providerView: View? = null
   private var stateWrapper: StateWrapper? = null
 
@@ -33,103 +35,65 @@ class SafeAreaView(context: Context?) : ReactViewGroup(context), ViewTreeObserve
   }
 
   /**
-   * Updates the view's safe area insets.
+   * Notifies the Fabric system about inset changes.
    */
   private fun updateInsets() {
     insets?.let { currentInsets ->
-      // Provide default edge modes if not set.
-      val currentEdges = edges ?: SafeAreaViewEdges(
-        SafeAreaViewEdgeModes.ADDITIVE,
-        SafeAreaViewEdgeModes.ADDITIVE,
-        SafeAreaViewEdgeModes.ADDITIVE,
-        SafeAreaViewEdgeModes.ADDITIVE
-      )
-
-      // Update state using StateWrapper if available.
+      // Update state using StateWrapper if available (preferred Fabric approach)
       stateWrapper?.let { wrapper ->
         val map = Arguments.createMap()
         map.putMap("insets", edgeInsetsToJsMap(currentInsets))
         wrapper.updateState(map)
         return
       } ?: run {
-        // Otherwise use the Fabric-compatible update.
-        val reactContext = context as? ReactContext
-        if (reactContext == null) {
-          Log.e(TAG, "Context is not an instance of ReactContext")
-          return
-        }
-
-        try {
-          val surfaceId = UIManagerHelper.getSurfaceId(reactContext)
-          val fabricUIManager =
-            UIManagerHelper.getUIManager(reactContext, UIManagerType.FABRIC) as? FabricUIManager
-          if (fabricUIManager != null) {
-            val event = InsetsChangeEvent(
-              surfaceId,
-              id,
-              currentInsets,
-              Rect(0f, 0f, width.toFloat(), height.toFloat())
-            )
-            UIManagerHelper.getEventDispatcherForReactTag(reactContext, id)?.dispatchEvent(event)
-            // Request layout to ensure UI updates.
-            requestLayout()
-            // Wait for the native modules queue thread to process this update.
-            waitForReactLayout(reactContext)
-          } else {
-            Log.e(TAG, "Failed to retrieve FabricUIManager")
-          }
-        } catch (e: Exception) {
-          Log.e(TAG, "Error updating safe area insets", e)
-        }
+        // Otherwise use event dispatch as fallback
+        dispatchInsetsChangeEvent(currentInsets)
       }
     }
   }
 
   /**
-   * Blocks the main thread until the native module thread is done processing,
-   * or until MAX_WAIT_TIME_NANO has elapsed.
+   * Dispatches an InsetsChangeEvent to the JS layer via Fabric.
    */
-  private fun waitForReactLayout(reactContext: ReactContext) {
-    var done = false
-    val lock = ReentrantLock()
-    val condition = lock.newCondition()
-    val startTime = System.nanoTime()
-    var waitTime = 0L
+  private fun dispatchInsetsChangeEvent(currentInsets: EdgeInsets) {
+    val reactContext = context as? ReactContext ?: run {
+      Log.e(TAG, "Context is not an instance of ReactContext")
+      return
+    }
 
-    // Enqueue a task on the native modules queue thread.
-    reactContext.runOnNativeModulesQueueThread {
-      lock.withLock {
-        if (!done) {
-          done = true
-          condition.signal()
-        }
+    try {
+      val surfaceId = UIManagerHelper.getSurfaceId(reactContext)
+      val fabricUIManager =
+        UIManagerHelper.getUIManager(reactContext, UIManagerType.FABRIC) as? FabricUIManager
+      if (fabricUIManager != null) {
+        val event = InsetsChangeEvent(
+          surfaceId,
+          id,
+          currentInsets,
+          Rect(0f, 0f, width.toFloat(), height.toFloat())
+        )
+        UIManagerHelper.getEventDispatcherForReactTag(reactContext, id)?.dispatchEvent(event)
+      } else {
+        Log.e(TAG, "Failed to retrieve FabricUIManager")
       }
-    }
-    // Wait for the condition to be signaled or until timeout.
-    lock.withLock {
-      while (!done && waitTime < MAX_WAIT_TIME_NANO) {
-        try {
-          condition.awaitNanos(MAX_WAIT_TIME_NANO)
-        } catch (ex: InterruptedException) {
-          // If interrupted, give up waiting.
-          done = true
-        }
-        waitTime = System.nanoTime() - startTime
-      }
-    }
-    if (waitTime >= MAX_WAIT_TIME_NANO) {
-      Log.w(TAG, "Timed out waiting for layout.")
+    } catch (e: Exception) {
+      Log.e(TAG, "Error dispatching InsetsChangeEvent", e)
     }
   }
 
+  /**
+   * These methods store the mode/edge settings.
+   * The actual application of these settings is handled by the Fabric system,
+   * not directly by this native view.
+   */
   fun setMode(mode: SafeAreaViewMode) {
-    this.mode = mode
-    updateInsets()
+    // Store mode for potential future use with StateWrapper
+    // No direct view manipulation here
   }
 
   fun setEdges(edges: SafeAreaViewEdges) {
-    this.edges = edges
-    updateInsets()
+    // Store edges for potential future use with StateWrapper
+    // No direct view manipulation here
   }
 
   /**
@@ -150,8 +114,9 @@ class SafeAreaView(context: Context?) : ReactViewGroup(context), ViewTreeObserve
 
   /**
    * Searches up the view hierarchy for a SafeAreaProvider.
+   * Returns null if no provider is found.
    */
-  private fun findProvider(): View {
+  private fun findProvider(): View? {
     var current = parent
     while (current != null) {
       if (current is SafeAreaProvider) {
@@ -159,7 +124,8 @@ class SafeAreaView(context: Context?) : ReactViewGroup(context), ViewTreeObserve
       }
       current = current.parent
     }
-    return this
+    Log.w(TAG, "No SafeAreaProvider found in the view hierarchy")
+    return null
   }
 
   override fun onAttachedToWindow() {
@@ -177,10 +143,8 @@ class SafeAreaView(context: Context?) : ReactViewGroup(context), ViewTreeObserve
 
   override fun onPreDraw(): Boolean {
     val didUpdate = maybeUpdateInsets()
-    if (didUpdate) {
-      requestLayout()
-    }
-    // Returning false cancels the current draw pass.
+    // If insets changed, return false to cancel this draw pass
+    // This gives Fabric time to process the inset change and update layout
     return !didUpdate
   }
 }
